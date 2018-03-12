@@ -1,30 +1,18 @@
 import pandas as pd
+from tqdm import tqdm, tqdm_pandas
 from whoosh.index import create_in, open_dir
 from whoosh.fields import Schema, ID, TEXT, KEYWORD
 from whoosh.query import *
 from whoosh import qparser
 from whoosh.scoring import BM25F, TF_IDF, Frequency
-from fuzzywuzzy import fuzz
 from itertools import combinations
+from nltk.tokenize import word_tokenize
 import os
 from string import punctuation
 from tqdm import tqdm
 import numpy as np
 
 from utils import Utility
-
-
-class Question(object):
-    def __init__(self, question_str):
-        self.question_str = question_str
-
-    def find_question_str_lem(self, question_id=None):
-        Utility.set_interrogative_pronouns()
-        self.question_str_lem = ' '.join([w for w in ' '.join(Utility.stem.lemmatize(self.question_str)).split() \
-                                          if w not in punctuation and w not in ['??'] and w not in Utility.interrogative_pronouns]
-                                         )
-        #np.save("question_lem/{}_lem".format(question_id), self.question_str_lem)
-        #self.question_str_lem = np.load("question_lem/{}_lem.npy".format(question_id)).item()
 
 
 class QuestionAnswerSystem(object):
@@ -45,14 +33,13 @@ class QuestionAnswerSystem(object):
         if not os.path.exists(database_lem_dir):
             os.mkdir(database_lem_dir)
 
-        stem = Utility.stem
         for paragraph in tqdm(df.paragraph.unique(), total=df.paragraph.nunique()):
             paragraph_id = (df[df.paragraph == paragraph].paragraph_id.values[0])
 
             with open("{}/{}.txt".format(database_origin_dir, paragraph_id), 'w') as fout:
                 fout.write(paragraph)
 
-            txt_lemm = ''.join(stem.lemmatize(paragraph))
+            txt_lemm = Utility.lemmatize(paragraph)
             with open("{}/{}.txt".format(database_lem_dir, paragraph_id), 'w') as fout:
                 fout.write(txt_lemm)
 
@@ -85,7 +72,7 @@ class QuestionAnswerSystem(object):
             group=qparser.OrGroup
         )
 
-    def find_rel_question_doc_ids(self, question, index_dir="../data/index", question_id=None):
+    def find_rel_question_doc_ids(self, question_str_lem, index_dir="../data/index"):
         if not hasattr(self, 'ix'):
             self.ix = open_dir(index_dir)
             self.query_parser = qparser.QueryParser(
@@ -94,21 +81,18 @@ class QuestionAnswerSystem(object):
                 group=qparser.OrGroup
             )
 
-        if not hasattr(question, 'question_str_lem'):
-            question.find_question_str_lem(question_id)
-
-        q = self.query_parser.parse(u'{}'.format(question.question_str_lem))
+        q = self.query_parser.parse(u'{}'.format(question_str_lem))
         with self.ix.searcher(weighting=self.search_alg) as searcher:
             results = searcher.search(q)
             doc_ids = [int(doc['title'].split('.')[0]) for doc in results]
         return doc_ids
 
     @staticmethod
-    def create_train_dataset(data_dir='../notebooks/bm25f', database_dir="../data/database_lem"):
+    def create_train_dataset(errors, data_dir='../notebooks/bm25f', database_dir="../data/database_origin"):# polyglot works with origin text to split into sentences
         df_dict = {}
         for f in tqdm(os.listdir(data_dir)):
-            if f.endswith('.npy'):
-                question_id = int(f.split('.')[0])
+            question_id = int(f.split('.')[0])
+            if f.endswith('.npy') and question_id not in errors:
                 res = {}
                 for doc_number, doc_id in enumerate(np.load('{}/{}'.format(data_dir, f))):
                     with open("{}/{}.txt".format(database_dir, doc_id)) as fin:
@@ -125,7 +109,7 @@ class QuestionAnswerSystem(object):
                 df_per_doc
             )
         df_with_list_of_sentences = df_with_list_of_sentences.reset_index()
-        df_with_list_of_sentences.columns = ['question_id', 'sentence_lem', 'doc_number']
+        df_with_list_of_sentences.columns = ['question_id', 'sentence', 'doc_number']
         return df_with_list_of_sentences
 
     @staticmethod
@@ -145,59 +129,70 @@ class QuestionAnswerSystem(object):
     def create_target(data):
         answer_in_sentence = []
         for row in tqdm(data.iterrows(), total=data.shape[0]):
-            answer_lem = row[1]['answer_lem']
-            sentence_lem = row[1]['sentence_lem']
-            answer_in_sentence.append(answer_lem in sentence_lem)
+            answer = row[1]['answer']
+            sentence = row[1]['sentence']
+            if answer[-1] in punctuation:
+                answer = answer[:-1]
+            answer_in_sentence.append(answer.lower() in sentence.lower())
         data['answer_in_sentence'] = np.array(answer_in_sentence) * 1
         return data
 
     @staticmethod
-    def get_max_match_sentence(data_row):
-        sentences = data_row["sentence_lem"].values
-        sentences_in_words = Utility.sentence_to_word(sentences)
-        question_in_words = Utility.sentence_to_word([data_row["question_lem"].values[0]])[0]
+    def get_base_stats(question, sentences, question_lem, sentences_lem, idfs, idfs_lem):
+        unique_word_count_scores, unique_word_percent_scores, sentence_len, bm25f_scores, tf_idf_scores = Utility.stats(question, sentences, idfs)
+        unique_lem_word_count_scores, unique_lem_word_percent_scores, sentence_lem_len, bm25f_lem_scores, tf_idf_lem_scores = Utility.stats(question_lem, sentences_lem, idfs_lem)
 
-        max_overlap = None
-        max_match_sentence_id = None
+        s = pd.Series([
+            unique_word_count_scores,
+            unique_lem_word_count_scores,
 
-        for sentence_id in range(len(sentences_in_words)):
-            sentence_words = set(sentences_in_words[sentence_id])
-            overlap = len(sentence_words.intersection(question_in_words))
-            if max_overlap is None or overlap > max_overlap:
-                max_overlap = overlap
-                max_match_sentence_id = sentence_id
-        return sentences[max_match_sentence_id]
+            unique_word_percent_scores,
+            unique_lem_word_percent_scores,
+
+            sentence_len,
+            sentence_lem_len,
+
+            bm25f_scores,
+            bm25f_lem_scores,
+
+            tf_idf_scores,
+            tf_idf_lem_scores,
+
+            sentences,
+            sentences_lem,
+        ])
+        return pd.DataFrame.from_items(zip(s.index, s.values))
 
     @staticmethod
-    def create_base_features(df):
-        if not hasattr(Utility, 'stop_words'):
-            Utility.set_stop_words()
+    def get_target_statistic(df, train_idxs, test_idxs, target, n_splits=10):
+        df = df.copy()
 
-        if not hasattr(Utility, 'interrogative_pronouns'):
-            Utility.set_interrogative_pronouns()
+        tqdm_pandas(tqdm(total=df.index.nunique()))
+        df['question_type'] = df.reset_index().groupby('question_id').progress_apply(
+            lambda x: Utility.get_interrogative_pronouns(x.question.values[0]))
 
-        stop_words = set(Utility.stop_words)
-        interrogative_pronouns = set(Utility.interrogative_pronouns)
+        df_train = Utility.count_target_statistic_by_folds(df.loc[train_idxs], target, n_splits=n_splits)
+        df_test = Utility.count_target_statistic(df.loc[train_idxs], df.loc[test_idxs], target)
+        df = pd.concat([df_train, df_test])
+        print('target statistic finished...')
 
-        features = {}
-        features['sentence_lem_no_punct'] = set(filter(lambda w: w not in punctuation, df.sentence_lem.split()))
-        features['sentence_lem_no_stop_words'] = set(filter(lambda w: w not in stop_words, features['sentence_lem_no_punct']))
+        tqdm_pandas(tqdm(total=df.question_id.nunique()))
+        speech_type_target_stat = df.groupby('question_id').progress_apply(lambda x: Utility.get_speech_type_target_stat(
+            x.question_id.values[0],
+            x.sentence_lem,
+            x['most_frequent_{}_speech_type_by_question_type'.format(target)].values[0]
+        ))
+        speech_type_target_stat.columns = ['question_id', 'sentence_lem', 'speech_type_{}_stat'.format(target)]
 
-        features['question_lem_no_punct'] = set(filter(lambda w: w not in punctuation, df.question_lem.split()))
-        features['question_lem_no_stop_words'] = set(filter(lambda w: w not in stop_words, features['question_lem_no_punct']))
-        features['question_lem_no_interrogative_pronouns'] = set(filter(lambda w: w not in interrogative_pronouns, features['question_lem_no_punct']))
+        tqdm_pandas(tqdm(total=df.question_id.nunique()))
+        ner_target_stat = df.groupby('question_id').progress_apply(lambda x: Utility.get_ner_target_stat(
+            x.question_id.values[0],
+            x.sentence_lem,
+            x['most_frequent_{}_ner_by_question_type'.format(target)].values[0]
+        ))
+        ner_target_stat.columns = ['question_id', 'sentence_lem', 'ner_{}_stat'.format(target)]
 
-        res = {}
-        res['sentence_lem_no_punct_len'] = len(features['sentence_lem_no_punct'])
-        res['sentence_lem_no_stop_words_len'] = len(features['sentence_lem_no_stop_words'])
+        return df, pd.merge(speech_type_target_stat, ner_target_stat, how='left', on=('question_id', 'sentence_lem'))
 
-        for i, j in combinations(features, r=2):
-            if i.split('_')[0] == j.split('_')[0]:
-                continue
-            res['{}_{}_intersect_len'.format(i, j)] = len(features[i] - features[j])
-            res['{}_{}_fuzz_ratio'.format(i, j)] = fuzz.ratio(features[i], features[j])
-            res['{}_{}_fuzz_partial_ratio'.format(i, j)] = fuzz.partial_ratio(features[i], features[j])
-            res['{}_{}_fuzz_token_sort_ratio'.format(i, j)] = fuzz.token_sort_ratio(features[i], features[j])
-            res['{}_{}_fuzz_token_set_ratio'.format(i, j)] = fuzz.token_set_ratio(features[i], features[j])
-            res['{}_{}_jaccard_sim'.format(i, j)] = len(features[i] & features[j]) / len(features[i] | features[j])
-        return pd.Series(res)
+
+
